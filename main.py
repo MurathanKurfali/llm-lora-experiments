@@ -131,7 +131,7 @@ class LanguageModelTrainer:
     def train_model(self, model, dataset, train_type, train_batch_size, max_steps, gradient_accumulation_steps,
                     num_train_epochs=10):
         # Construct output directory name
-        output_dir = f"{self.output_dir}/{self.model_name.replace('/', '-')}_{train_type}_{self.target_lang}_{self.train_dataset_path.replace('/', '-')}_Ep-{num_train_epochs}"
+        output_dir = f"{self.output_dir}/{self.model_name.replace('/', '-')}_{train_type}_{self.target_lang}_{self.train_dataset_path.replace('/', '-')}_max_steps-{num_train_epochs}"
         if train_type == "adapter":
             output_dir += f"_r_{self.r}_alpha_{self.lora_alpha}"
 
@@ -234,6 +234,7 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=32, help="context size")
 
     parser.add_argument("--max_length", type=int, default=2048, help="context size")
+    parser.add_argument("--max_steps", type=int, default=20000, help="context size")
 
     parser.add_argument("--eval_dataset_path", type=str, default=None, required=False,
                         help="Path to the evaluation dataset.")
@@ -249,8 +250,7 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=256, help="Alpha value for LoRA.")
     parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs.")
 
-    parser.add_argument("--output_dir", type=str, required=False, default="saved_models",
-                        help="Directory to save trained models.")
+    parser.add_argument("--output_dir", type=str, required=False, default="saved_models", help="Directory to save trained models.")
     parser.add_argument("--do_eval", action='store_true', help="Only evaluate the model on the evaluation dataset.")
     args = parser.parse_args()
 
