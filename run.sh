@@ -1,1 +1,1 @@
-python -u main.py --model_name facebook/xglm-564M --train_dataset_path legacy-datasets/mc4 --eval_dataset_path legacy-datasets/mc4  --train_type adapter --target_lang tr --output_dir saved_models --r 128 --lora_alpha 256 --debug_limit 100
+python -u main.py --model_name facebook/xglm-1.7B --train_dataset_path legacy-datasets/mc4 --eval_dataset_path legacy-datasets/mc4  --train_type adapter --target_lang tr --output_dir saved_models --r 128 --lora_alpha 256

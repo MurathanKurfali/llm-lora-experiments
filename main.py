@@ -128,7 +128,7 @@ class LanguageModelTrainer:
         self.print_trainable_parameters(lora_model)
         return lora_model
 
-    def train_model(self, model, dataset, train_type, num_train_epochs=10):
+    def train_model(self, model, dataset, train_type, train_batch_size, max_steps,  num_train_epochs=10):
         # Construct output directory name
         output_dir = f"{self.output_dir}/{self.model_name.replace('/', '-')}_{train_type}_{self.target_lang}_{self.train_dataset_path.replace('/', '-')}_Ep-{num_train_epochs}"
         if train_type == "adapter":
@@ -141,14 +141,14 @@ class LanguageModelTrainer:
             output_dir=output_dir,
             overwrite_output_dir=True,
             num_train_epochs=num_train_epochs,
-            per_device_train_batch_size=1,
+            per_device_train_batch_size=train_batch_size,
             gradient_accumulation_steps=8,
-            save_steps=5000,
+            save_steps=2500,
             save_total_limit=1,
             logging_dir='./logs',
-            logging_steps=2500,
+            logging_steps=1000,
             report_to="none",
-            max_steps=200,
+            max_steps=max_steps,
         )
 
         data_collator = DataCollatorForLanguageModeling(
@@ -227,23 +227,23 @@ def main():
     parser.add_argument("--train_dataset_path", type=str, required=False, help="Path to the training dataset.")
     parser.add_argument("--train_dataset_config", type=str, required=False, help="Configuration for the training dataset.")
     parser.add_argument("--target_lang", type=str, default="fao", help="Target language for the dataset.")
-    parser.add_argument("--max_length", type=int, default=1024, help="context size")
+    parser.add_argument("--train_batch_size", type=int, default=2, help="context size")
+
+    parser.add_argument("--max_length", type=int, default=2048, help="context size")
 
     parser.add_argument("--eval_dataset_path", type=str, default=None, required=False,
                         help="Path to the evaluation dataset.")
     parser.add_argument("--eval_dataset_config", type=str, default=None, required=False,
                         help="Configuration for the evaluation dataset.")
 
-    parser.add_argument("--train_type", type=str, choices=["adapter", "fine-tune"], required=False,
-                        help="Training type: 'adapter' for LoRA training or 'fine-tune' for full model training.")
+    parser.add_argument("--train_type", type=str, choices=["adapter", "fine-tune"], required=False, help="Training type: 'adapter' for LoRA training or 'fine-tune' for full model training.")
     parser.add_argument("--debug_limit", type=int, default=None, help="Limit the number of training examples for debugging purposes.")
 
     parser.add_argument("--r", type=int, default=128, help="Rank (r) value for LoRA.")
     parser.add_argument("--lora_alpha", type=int, default=256, help="Alpha value for LoRA.")
     parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs.")
 
-    parser.add_argument("--output_dir", type=str, required=False, default="saved_models",
-                        help="Directory to save trained models.")
+    parser.add_argument("--output_dir", type=str, required=False, default="saved_models", help="Directory to save trained models.")
     parser.add_argument("--do_eval", action='store_true', help="Only evaluate the model on the evaluation dataset.")
     args = parser.parse_args()
 
@@ -272,9 +272,12 @@ def main():
 
         if args.train_type == "adapter":
             model = trainer.apply_lora(trainer.model, args.r, args.lora_alpha)
-            trainer.train_model(model, train_tokenized_dataset, "adapter", num_train_epochs=args.num_train_epochs)
+            trainer.train_model(model, train_tokenized_dataset, "adapter",
+                                train_batch_size=args.train_batch_size,
+                                max_steps=args.max_steps)
         elif args.train_type == "fine-tune":
-            trainer.train_model(trainer.model, train_tokenized_dataset, "fine-tune", num_train_epochs=args.num_train_epochs)
+            trainer.train_model(trainer.model, train_tokenized_dataset, "fine-tune",  train_batch_size=args.train_batch_size,
+                                max_steps=args.max_steps)
 
         if args.eval_dataset_path:
             logger.info("Evaluating the trained model...")
