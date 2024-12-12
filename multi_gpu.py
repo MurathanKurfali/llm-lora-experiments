@@ -14,6 +14,7 @@ from transformers import (
 )
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
+from torch.utils.data import DataLoader, IterableDataset
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,15 @@ def setup_distributed():
     # Initialize the default distributed process group
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
+
+class HuggingFaceDatasetWrapper(IterableDataset):
+    def __init__(self, hf_dataset, formatting_func):
+        self.hf_dataset = hf_dataset
+        self.formatting_func = formatting_func
+
+    def __iter__(self):
+        for example in self.hf_dataset:
+            yield self.formatting_func(example)
 
 class LanguageModelTrainer:
     def __init__(self, model_name, train_dataset_path, eval_dataset_path, output_dir,
@@ -49,7 +59,6 @@ class LanguageModelTrainer:
 
     def load_model(self):
         logger.info(f"Loading model '{self.model_name}'...")
-        # Do not move model to device here; Trainer will handle device placement.
         model = AutoModelForCausalLM.from_pretrained(self.model_name)
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
@@ -71,11 +80,11 @@ class LanguageModelTrainer:
         )
 
     def load_and_format_dataset(self, dataset_name, dataset_config, split, limit=None, max_length=None):
-        def formatting_prompts_func(examples):
-            if "text" in examples:
-                return {"text": [example + " " + self.tokenizer.eos_token for example in examples["text"]]}
-            elif "sentence" in examples:
-                return {"text": [example + " " + self.tokenizer.eos_token for example in examples["sentence"]]}
+        def formatting_prompts_func(example):
+            if "text" in example:
+                return {"text": example["text"] + " " + self.tokenizer.eos_token}
+            elif "sentence" in example:
+                return {"text": example["sentence"] + " " + self.tokenizer.eos_token}
             else:
                 raise ValueError("Expected 'text' or 'sentence' in dataset examples.")
 
@@ -84,34 +93,38 @@ class LanguageModelTrainer:
             dataset_name, self.target_lang,
             split=split,
             trust_remote_code=True,
-            streaming=False,
+            streaming=True,
         )
-        dataset = dataset.filter(lambda example: example.get("text") is not None and len(example["text"].strip()) > 0, num_procs=32)
+        dataset = dataset.filter(lambda example: example.get("text") is not None and len(example["text"].strip()) > 0)
 
-        # Limit dataset size for debugging
         if limit and split == "train":
             dataset = dataset.take(limit)
             logger.info(f"Dataset size after limiting: {len(list(dataset))}")
 
-        dataset = dataset.map(formatting_prompts_func, batched=True, num_procs=32)
+        wrapped_dataset = HuggingFaceDatasetWrapper(dataset, formatting_prompts_func)
         logger.info(f"Dataset loaded and formatted for language '{self.target_lang}'.")
-        return dataset
+        return wrapped_dataset
 
-    def tokenize_dataset(self, dataset):
-        def tokenize_function(examples):
+    def tokenize_dataset(self, dataset, batch_size=32, num_workers=4):
+        def tokenize_function(batch):
             return self.tokenizer(
-                examples['text'],
+                batch['text'],
                 truncation=True,
                 padding="max_length",
                 max_length=self.max_length
             )
 
-        tokenized_dataset = dataset.map(tokenize_function, batched=True, num_procs=32)
+        data_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            collate_fn=lambda batch: tokenize_function({"text": [item["text"] for item in batch]}),
+        )
+
         logger.info(f"Dataset tokenized with max_length={self.max_length}.")
-        return tokenized_dataset
+        return data_loader
 
     def apply_lora(self, model, r, lora_alpha):
-        # Apply LoRA
         self.r = r
         self.lora_alpha = lora_alpha
         logger.info(f"Applying LoRA to the model r={self.r} ; alpha={self.lora_alpha}...")
@@ -130,7 +143,6 @@ class LanguageModelTrainer:
         return lora_model
 
     def train_model(self, model, dataset, train_type, train_batch_size, max_steps, gradient_accumulation_steps):
-        # Construct output directory name
         output_dir = f"{self.output_dir}/{self.model_name.replace('/', '-')}_{train_type}_{self.target_lang}_{self.train_dataset_path.replace('/', '-')}_max_steps-{max_steps}"
         if train_type == "adapter":
             output_dir += f"_r_{self.r}_alpha_{self.lora_alpha}"
@@ -138,7 +150,6 @@ class LanguageModelTrainer:
         logger.info(f"Starting training: {train_type}... Output directory: {output_dir}")
         logger.info(f"Training for {max_steps} steps...")
 
-        # Trainer should handle local rank automatically.
         training_args = TrainingArguments(
             output_dir=output_dir,
             overwrite_output_dir=True,
@@ -151,15 +162,14 @@ class LanguageModelTrainer:
             report_to="none",
             max_steps=max_steps,
             learning_rate=2e-5,
-            fp16=True,  # Enable mixed-precision training
+            fp16=True,
             dataloader_pin_memory=True,
-            ddp_find_unused_parameters=False,  # Often needed for large models
+            ddp_find_unused_parameters=False,
         )
 
         data_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer, mlm=False
         )
-        dataset = dataset.with_format("torch")
 
         trainer = Trainer(
             model=model,
@@ -229,7 +239,6 @@ class LanguageModelTrainer:
                 file.write(f"Generated text {idx + 1}:\n{text}\n\n")
         logger.info(f"Generated texts saved to {filename}")
 
-
 def main():
     setup_distributed()
     parser = argparse.ArgumentParser()
@@ -283,7 +292,6 @@ def main():
                                                         limit=args.debug_limit, split="train",
                                                         max_length=args.max_length)
         train_tokenized_dataset = trainer.tokenize_dataset(train_dataset)
-        train_tokenized_dataset = train_tokenized_dataset.with_format("torch")
 
         if args.train_type == "adapter":
             model = trainer.apply_lora(trainer.model, args.r, args.lora_alpha)
@@ -304,10 +312,7 @@ def main():
             eval_dataset = trainer.load_and_format_dataset(args.eval_dataset_path,
                                                            args.eval_dataset_config,
                                                            split="validation", max_length=args.max_length)
-            eval_dataset = eval_dataset.take(5000)
             eval_tokenized_dataset = trainer.tokenize_dataset(eval_dataset)
-            eval_tokenized_dataset = eval_tokenized_dataset.with_format("torch")
-
             trainer.compute_perplexity(trainer.model, eval_tokenized_dataset)
 
 if __name__ == "__main__":
