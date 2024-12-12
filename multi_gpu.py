@@ -84,16 +84,16 @@ class LanguageModelTrainer:
             dataset_name, self.target_lang,
             split=split,
             trust_remote_code=True,
-            streaming=True,
+            streaming=False,
         )
-        dataset = dataset.filter(lambda example: example.get("text") is not None and len(example["text"].strip()) > 0)
+        dataset = dataset.filter(lambda example: example.get("text") is not None and len(example["text"].strip()) > 0, num_procs=32)
 
-        # Optional: Limit dataset size for debugging
+        # Limit dataset size for debugging
         if limit and split == "train":
             dataset = dataset.take(limit)
             logger.info(f"Dataset size after limiting: {len(list(dataset))}")
 
-        dataset = dataset.map(formatting_prompts_func, batched=True)
+        dataset = dataset.map(formatting_prompts_func, batched=True, num_procs=32)
         logger.info(f"Dataset loaded and formatted for language '{self.target_lang}'.")
         return dataset
 
@@ -106,7 +106,7 @@ class LanguageModelTrainer:
                 max_length=self.max_length
             )
 
-        tokenized_dataset = dataset.map(tokenize_function, batched=True)
+        tokenized_dataset = dataset.map(tokenize_function, batched=True, num_procs=32)
         logger.info(f"Dataset tokenized with max_length={self.max_length}.")
         return tokenized_dataset
 
