@@ -2,6 +2,8 @@ import argparse
 import numpy as np
 import torch
 import logging
+import os
+import torch.distributed as dist
 
 from transformers import (
     AutoModelForCausalLM,
@@ -17,11 +19,16 @@ from peft import LoraConfig, get_peft_model
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def setup_distributed():
+    # If using torchrun, these environment variables are set automatically
+    # Initialize the default distributed process group
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
 
 class LanguageModelTrainer:
     def __init__(self, model_name, train_dataset_path, eval_dataset_path, output_dir,
                  target_lang,
-                 max_length=256, device='cuda'):
+                 max_length=256):
         self.lora_alpha = None
         self.r = None
         self.target_lang = target_lang
@@ -29,25 +36,27 @@ class LanguageModelTrainer:
         self.train_dataset_path = train_dataset_path
         self.eval_dataset_path = eval_dataset_path
         self.output_dir = output_dir
-        self.device = device
         self.max_length = max_length
 
-        if not torch.cuda.is_available() and self.device.startswith('cuda'):
-            logger.warning("CUDA device not available, using CPU instead.")
-            self.device = 'cpu'
+        # Local rank derived from environment variables set by torchrun
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-        logger.info(f"Using device: {self.device}")
+        # Set the current device
+        torch.cuda.set_device(self.local_rank)
+
+        logger.info(f"Local Rank: {self.local_rank}. Initializing model/tokenizer ...")
         self.model, self.tokenizer = self.load_model()
 
     def load_model(self):
         logger.info(f"Loading model '{self.model_name}'...")
-        model = AutoModelForCausalLM.from_pretrained(self.model_name).to(self.device)
+        # Do not move model to device here; Trainer will handle device placement.
+        model = AutoModelForCausalLM.from_pretrained(self.model_name)
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        logger.info(f"{self.model_name} loaded and moved to {self.device}.")
+        logger.info(f"{self.model_name} loaded.")
         return model, tokenizer
 
     def print_trainable_parameters(self, model):
@@ -70,13 +79,12 @@ class LanguageModelTrainer:
             else:
                 raise ValueError("Expected 'text' or 'sentence' in dataset examples.")
 
-        # Load dataset
         logger.info(f"Loading dataset '{dataset_name}' for language '{self.target_lang}'...")
         dataset = load_dataset(
             dataset_name, self.target_lang,
             split=split,
             trust_remote_code=True,
-            streaming=True,  # Enable streaming for large datasets
+            streaming=True,
         )
         dataset = dataset.filter(lambda example: example.get("text") is not None and len(example["text"].strip()) > 0)
 
@@ -85,10 +93,8 @@ class LanguageModelTrainer:
             dataset = dataset.take(limit)
             logger.info(f"Dataset size after limiting: {len(list(dataset))}")
 
-        # Map to required format
         dataset = dataset.map(formatting_prompts_func, batched=True)
         logger.info(f"Dataset loaded and formatted for language '{self.target_lang}'.")
-        # logger.info(f"Dataset Statistics - Number of examples in the [[{split}]] split set") # {len(dataset)}")
         return dataset
 
     def tokenize_dataset(self, dataset):
@@ -105,7 +111,7 @@ class LanguageModelTrainer:
         return tokenized_dataset
 
     def apply_lora(self, model, r, lora_alpha):
-        # Apply LoRA with optimized settings
+        # Apply LoRA
         self.r = r
         self.lora_alpha = lora_alpha
         logger.info(f"Applying LoRA to the model r={self.r} ; alpha={self.lora_alpha}...")
@@ -115,8 +121,8 @@ class LanguageModelTrainer:
             lora_dropout=0.1,
             bias="none",
             task_type="CAUSAL_LM",
-            target_modules= 'all-linear',
-            fan_in_fan_out=False  # Adjusted for XGLM compatibility
+            target_modules='all-linear',
+            fan_in_fan_out=False
         )
         lora_model = get_peft_model(model, lora_config)
         logger.info("LoRA applied successfully. Parameter count of the LoRA model:")
@@ -132,6 +138,7 @@ class LanguageModelTrainer:
         logger.info(f"Starting training: {train_type}... Output directory: {output_dir}")
         logger.info(f"Training for {max_steps} steps...")
 
+        # Trainer should handle local rank automatically.
         training_args = TrainingArguments(
             output_dir=output_dir,
             overwrite_output_dir=True,
@@ -143,7 +150,10 @@ class LanguageModelTrainer:
             logging_steps=1000,
             report_to="none",
             max_steps=max_steps,
-            learning_rate=2e-5
+            learning_rate=2e-5,
+            fp16=True,  # Enable mixed-precision training
+            dataloader_pin_memory=True,
+            ddp_find_unused_parameters=False,  # Often needed for large models
         )
 
         data_collator = DataCollatorForLanguageModeling(
@@ -158,6 +168,7 @@ class LanguageModelTrainer:
             data_collator=data_collator,
             tokenizer=self.tokenizer
         )
+
         trainer.train()
         logger.info(f"Training ({train_type}) completed.")
 
@@ -170,7 +181,10 @@ class LanguageModelTrainer:
             logging_dir='./logs',
             logging_steps=100,
             do_eval=True,
-            report_to="none"
+            report_to="none",
+            fp16=True,
+            dataloader_pin_memory=True,
+            ddp_find_unused_parameters=False,
         )
 
         data_collator = DataCollatorForLanguageModeling(
@@ -195,8 +209,8 @@ class LanguageModelTrainer:
     def generate_sentences(self, model, prompt, max_length=200, num_return_sequences=3,
                            temperature=0.4, top_k=50, top_p=0.95, experiment_name="experiment"):
         logger.info("Generating sentences based on prompt...")
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         model.eval()
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
         outputs = model.generate(
             inputs['input_ids'],
             max_length=max_length,
@@ -217,6 +231,7 @@ class LanguageModelTrainer:
 
 
 def main():
+    setup_distributed()
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, required=True,
                         help="The name of the model to use for training or evaluation.")
@@ -224,28 +239,24 @@ def main():
     parser.add_argument("--train_dataset_config", type=str, required=False,
                         help="Configuration for the training dataset.")
     parser.add_argument("--target_lang", type=str, default="fao", help="Target language for the dataset.")
-    parser.add_argument("--train_batch_size", type=int, default=4, help="context size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=32, help="context size")
-
-    parser.add_argument("--max_length", type=int, default=2048, help="context size")
-    parser.add_argument("--max_steps", type=int, default=20000, help="context size")
-
+    parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size per device.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=32, help="Gradient accumulation steps.")
+    parser.add_argument("--max_length", type=int, default=2048, help="Max sequence length.")
+    parser.add_argument("--max_steps", type=int, default=20000, help="Max training steps.")
     parser.add_argument("--eval_dataset_path", type=str, default=None, required=False,
                         help="Path to the evaluation dataset.")
     parser.add_argument("--eval_dataset_config", type=str, default=None, required=False,
                         help="Configuration for the evaluation dataset.")
-
     parser.add_argument("--train_type", type=str, choices=["adapter", "fine-tune"], required=False,
-                        help="Training type: 'adapter' for LoRA training or 'fine-tune' for full model training.")
+                        help="Training type: 'adapter' for LoRA or 'fine-tune' for full model.")
     parser.add_argument("--debug_limit", type=int, default=None,
-                        help="Limit the number of training examples for debugging purposes.")
-
-    parser.add_argument("--r", type=int, default=128, help="Rank (r) value for LoRA.")
-    parser.add_argument("--lora_alpha", type=int, default=256, help="Alpha value for LoRA.")
+                        help="Limit number of training examples for debugging.")
+    parser.add_argument("--r", type=int, default=128, help="LoRA rank.")
+    parser.add_argument("--lora_alpha", type=int, default=256, help="LoRA alpha.")
     parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs.")
-
-    parser.add_argument("--output_dir", type=str, required=False, default="saved_models", help="Directory to save trained models.")
+    parser.add_argument("--output_dir", type=str, default="saved_models", help="Directory to save trained models.")
     parser.add_argument("--do_eval", action='store_true', help="Only evaluate the model on the evaluation dataset.")
+
     args = parser.parse_args()
 
     trainer = LanguageModelTrainer(
@@ -298,7 +309,6 @@ def main():
             eval_tokenized_dataset = eval_tokenized_dataset.with_format("torch")
 
             trainer.compute_perplexity(trainer.model, eval_tokenized_dataset)
-
 
 if __name__ == "__main__":
     main()
