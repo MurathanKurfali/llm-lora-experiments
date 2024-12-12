@@ -4,7 +4,6 @@ import torch
 import logging
 import os
 import torch.distributed as dist
-from torch.utils.data import DataLoader, IterableDataset
 
 from transformers import (
     AutoModelForCausalLM,
@@ -106,19 +105,10 @@ class LanguageModelTrainer:
                 padding="max_length",
                 max_length=self.max_length
             )
-        data_loader = DataLoader(
-            dataset,
-            batch_size=32,
-            num_workers=32,
-            collate_fn=lambda batch: tokenize_function({"text": [item["text"] for item in batch]}),
-        )
 
+        tokenized_dataset = dataset.map(tokenize_function, batched=True)#, num_proc=32)
         logger.info(f"Dataset tokenized with max_length={self.max_length}.")
-        return data_loader
-
-        #tokenized_dataset = dataset.map(tokenize_function, batched=True)#, num_proc=32)
-        #logger.info(f"Dataset tokenized with max_length={self.max_length}.")
-        #return tokenized_dataset
+        return tokenized_dataset
 
     def apply_lora(self, model, r, lora_alpha):
         # Apply LoRA
@@ -155,9 +145,9 @@ class LanguageModelTrainer:
             per_device_train_batch_size=train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             save_steps=2500,
-            save_total_limit=1,
+            save_total_limit=10,
             logging_dir='./logs',
-            logging_steps=1000,
+            logging_steps=100,
             report_to="none",
             max_steps=max_steps,
             learning_rate=2e-5,
